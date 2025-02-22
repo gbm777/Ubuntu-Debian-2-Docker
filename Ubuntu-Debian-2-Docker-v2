@@ -1,114 +1,76 @@
 #!/bin/bash
-set -eo pipefail
 
-# 内存保护机制
-export XZ_DEFAULTS="-T0 --memlimit-compress=80%"
+# Docker化Ubuntu系统打包脚本
+# 功能：将运行中的Ubuntu系统打包成高压缩率tar文件，适配Docker导入
 
-# 增强型排除列表（包含动态路径）
-EXCLUDE_PATHS=(
-    "/proc" "/sys" "/dev" "/tmp" "/run" "/mnt" "/media"
-    "/var/cache" "/var/run" "/var/lock" "/lost+found"
-    "/sys/module" "/sys/firmware" "/sys/fs/cgroup"
-    "/sys/kernel" "/sys/devices/virtual" "/sys/class/*/device"
-    "/sys/power" "/sys/hypervisor"
-    "/proc/*" "/sys/*" "/dev/*" "/tmp/*" "/run/*" "/mnt/*" "/media/*"
-    "/var/cache/*" "/var/run/*" "/var/lock/*" "/lost+found/*"
-    "/sys/module/*" "/sys/firmware/*" "/sys/fs/cgroup/*"
-    "/sys/kernel/*" "/sys/devices/virtual/*" "/sys/class/*/device/*"
-    "/sys/power/*" "/sys/hypervisor/*"
-    "/var/lib/docker/tmp"  # 动态docker临时目录
-    "/var/lib/apt/lists/partial/*"  # apt缓存
-)
-
-# 日志配置
-TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-OUTPUT_FILE="ubuntu_system_${TIMESTAMP}.tar.xz"
-LOG_FILE="${OUTPUT_FILE%.*}.log"
-
-# 日志函数
-log() {
-    local level=$1
-    local message=$2
-    local timestamp=$(date "+%Y-%m-%d %H:%M:%S.%3N")
-    echo "[$timestamp] [$level] $message" | tee -a "$LOG_FILE" >&2
-}
-
-: > "$LOG_FILE"
-log "INFO" "初始化备份任务：$TIMESTAMP"
-
-# 动态校准进度机制
-calculate_size() {
-    log "INFO" "开始动态计算数据量..."
-    sudo du -sbx / "${tar_excludes[@]}" 2>&1 | tee -a "$LOG_FILE" | awk '{sum+=$1} END{print sum}'
-}
-
-# 转换排除参数
-tar_excludes=()
-find_excludes=()
-for path in "${EXCLUDE_PATHS[@]}"; do
-    tar_excludes+=( "--exclude=$path" )
-    find_excludes+=( -path "$path" -prune -o )
-done
-
-# 首次计算基准大小
-INITIAL_SIZE=$(calculate_size)
-log "INFO" "初始数据量估算：$((INITIAL_SIZE/1024/1024)) MB"
-
-# 记录打包前的文件元数据
-PRE_TAR_FILE_COUNT=$(sudo find / "${find_excludes[@]}" -type f | wc -l)
-
-# 打包压缩流程
-{
-    log "INFO" "启动打包进程..."
-    sudo tar -cpPf - / "${tar_excludes[@]}" \
-        --warning=no-all \
-        --ignore-failed-read 2>&1
-    
-    log "INFO" "打包进程已正常退出，等待数据刷新..."
-    sync  # 确保所有数据写入管道
-} | pv -p -t -e -s $INITIAL_SIZE -N "打包进度" | tee >(sha256sum > "${OUTPUT_FILE}.sha256") \
-  | xz -T0 -7e -v > "$OUTPUT_FILE" 2> >(
-    # 压缩进度处理器
-    while IFS= read -r line; do
-        if [[ $line =~ ([0-9.]+)% ]]; then
-            percent=${BASH_REMATCH[1]}
-            printf "[%s] [PROGRESS] 压缩进度: %s%%\n" "$(date +%T)" "$percent" >> "$LOG_FILE"
-            printf "压缩进度: %s%%\r" "$percent" >&2
-        else
-            echo "[$(date +%T)] [XZ] $line" >> "$LOG_FILE"
-        fi
-    done
-)
-
-# 记录打包后的文件元数据
-POST_TAR_FILE_COUNT=$(sudo find / "${find_excludes[@]}" -type f | wc -l)
-
-# 检查是否有新增打包条目
-if [ "$PRE_TAR_FILE_COUNT" -eq "$POST_TAR_FILE_COUNT" ]; then
-    log "INFO" "没有新增打包条目，结束打包"
-    rm "$OUTPUT_FILE" "${OUTPUT_FILE}.sha256"
-    exit 0
-fi
-
-# 动态校准最终大小
-FINAL_SIZE=$(stat -c%s "$OUTPUT_FILE")
-log "INFO" "实际输出文件大小：$((FINAL_SIZE/1024/1024)) MB"
-
-# 完整性验证
-log "INFO" "启动完整性校验..."
-VALIDATION_DATA=$(tar -tvJf "$OUTPUT_FILE" 2>&1 | tee -a "$LOG_FILE" | wc -l)
-if [ $VALIDATION_DATA -lt 100 ]; then
-    log "ERROR" "压缩文件可能损坏，验证条目不足"
+# 安全检测：强制Root权限
+if [[ $EUID -ne 0 ]]; then
+    echo -e "\033[31m错误：此脚本必须使用sudo或root用户运行\033[0m"
     exit 1
 fi
 
-# 校验和验证
-log "INFO" "校验和验证..."
-CALC_SUM=$(sha256sum "$OUTPUT_FILE" | cut -d' ' -f1)
-STORED_SUM=$(cat "${OUTPUT_FILE}.sha256" | cut -d' ' -f1)
-if [ "$CALC_SUM" != "$STORED_SUM" ]; then
-    log "ERROR" "校验和不匹配：计算值=$CALC_SUM，存储值=$STORED_SUM"
-    exit 2
-fi
+# 配置参数
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+OUTPUT_FILE="ubuntu-docker-${TIMESTAMP}.tar.xz"
+COMPRESS_THREADS=$(nproc)  # 自动获取CPU核心数
+XZ_OPTIONS="-9 -e --check=crc64 --threads=$COMPRESS_THREADS"
 
-log "SUCCESS" "备份验证完成，数据完整"
+# 智能排除列表（可根据需要调整）
+EXCLUDE_PATTERNS=(
+    # 系统虚拟文件系统
+    "/proc/*"
+    "/sys/*"
+    "/dev/*"
+    "/tmp/*"
+    
+    # 运行时内容
+    "/run/*"
+    "/var/run/*"
+    "/var/lock/*"
+    
+    # 存储挂载点
+    "/mnt/*"
+    "/media/*"
+    
+    # 特殊文件
+    "/swapfile"
+    "/lost+found"
+    
+    # 缓存与日志
+    "/var/cache/apt/archives/*.deb"
+    "/var/log/**/*.log"
+    
+    # 排除自身输出文件
+    "$(pwd)/${OUTPUT_FILE}"
+    "/var/lib/docker/*"  # Docker运行时目录
+    "/.snapshots/*"      # Btrfs快照
+)
+
+# 构建排除参数
+EXCLUDE_OPTS=()
+for pattern in "${EXCLUDE_PATTERNS[@]}"; do
+    EXCLUDE_OPTS+=(--exclude="$pattern")
+done
+
+# 开始打包流程
+echo -e "\033[34m正在打包系统（压缩线程数：${COMPRESS_THREADS}）...\033[0m"
+
+# 修正后的find命令：排除临时文件并安全处理特殊字符
+time find / \( -name "*~" -o -name "*.swp" \) -prune -o -type f -print0 |
+    /usr/bin/tar -cp \
+        --null -T - \
+        --one-file-system \
+        --xattrs \
+        --warning=no-xattr \
+        "${EXCLUDE_OPTS[@]}" \
+    | /usr/bin/xz $XZ_OPTIONS > "$OUTPUT_FILE"
+
+# 结果校验
+if [[ $? -eq 0 ]]; then
+    echo -e "\033[32m打包成功！输出文件：$(realpath "${OUTPUT_FILE}")\033[0m"
+    echo -e "导入Docker命令："
+    echo -e "  \033[35mdocker import ${OUTPUT_FILE} ubuntu:custom-${TIMESTAMP}\033[0m"
+else
+    echo -e "\033[31m错误：打包过程失败，请检查存储空间和权限\033[0m"
+    exit 1
+fi
