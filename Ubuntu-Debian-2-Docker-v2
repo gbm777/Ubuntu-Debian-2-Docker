@@ -44,13 +44,18 @@ calculate_size() {
 
 # 转换排除参数
 tar_excludes=()
+find_excludes=()
 for path in "${EXCLUDE_PATHS[@]}"; do
     tar_excludes+=( "--exclude=$path" )
+    find_excludes+=( -path "$path" -prune -o )
 done
 
 # 首次计算基准大小
 INITIAL_SIZE=$(calculate_size)
 log "INFO" "初始数据量估算：$((INITIAL_SIZE/1024/1024)) MB"
+
+# 记录打包前的文件元数据
+PRE_TAR_FILE_COUNT=$(sudo find / "${find_excludes[@]}" -type f | wc -l)
 
 # 打包压缩流程
 {
@@ -61,7 +66,7 @@ log "INFO" "初始数据量估算：$((INITIAL_SIZE/1024/1024)) MB"
     
     log "INFO" "打包进程已正常退出，等待数据刷新..."
     sync  # 确保所有数据写入管道
-} | pv -n -s $INITIAL_SIZE -N "打包进度" | tee >(sha256sum > "${OUTPUT_FILE}.sha256") \
+} | pv -p -t -e -s $INITIAL_SIZE -N "打包进度" | tee >(sha256sum > "${OUTPUT_FILE}.sha256") \
   | xz -T0 -7e -v > "$OUTPUT_FILE" 2> >(
     # 压缩进度处理器
     while IFS= read -r line; do
@@ -74,6 +79,16 @@ log "INFO" "初始数据量估算：$((INITIAL_SIZE/1024/1024)) MB"
         fi
     done
 )
+
+# 记录打包后的文件元数据
+POST_TAR_FILE_COUNT=$(sudo find / "${find_excludes[@]}" -type f | wc -l)
+
+# 检查是否有新增打包条目
+if [ "$PRE_TAR_FILE_COUNT" -eq "$POST_TAR_FILE_COUNT" ]; then
+    log "INFO" "没有新增打包条目，结束打包"
+    rm "$OUTPUT_FILE" "${OUTPUT_FILE}.sha256"
+    exit 0
+fi
 
 # 动态校准最终大小
 FINAL_SIZE=$(stat -c%s "$OUTPUT_FILE")
