@@ -1,76 +1,97 @@
 #!/bin/bash
-
-# Docker化Ubuntu系统打包脚本
-# 功能：将运行中的Ubuntu系统打包成高压缩率tar文件，适配Docker导入
-
-# 安全检测：强制Root权限
-if [[ $EUID -ne 0 ]]; then
-    echo -e "\033[31m错误：此脚本必须使用sudo或root用户运行\033[0m"
-    exit 1
-fi
+set -eo pipefail
 
 # 配置参数
-TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-OUTPUT_FILE="ubuntu-docker-${TIMESTAMP}.tar.xz"
-COMPRESS_THREADS=$(nproc)  # 自动获取CPU核心数
-XZ_OPTIONS="-9 -e --check=crc64 --threads=$COMPRESS_THREADS"
+TAG_NAME="ubuntu-docker-full:$(date +%Y%m%d)"
+DOCKER_DATA_DIR="/var/lib/docker"
+TMP_DIR=$(mktemp -d -t dockerized-system-XXXXXX)
 
-# 智能排除列表（可根据需要调整）
-EXCLUDE_PATTERNS=(
-    # 系统虚拟文件系统
-    "/proc/*"
-    "/sys/*"
-    "/dev/*"
-    "/tmp/*"
-    
-    # 运行时内容
-    "/run/*"
-    "/var/run/*"
-    "/var/lock/*"
-    
-    # 存储挂载点
-    "/mnt/*"
-    "/media/*"
-    
-    # 特殊文件
-    "/swapfile"
-    "/lost+found"
-    
-    # 缓存与日志
-    "/var/cache/apt/archives/*.deb"
-    "/var/log/**/*.log"
-    
-    # 排除自身输出文件
-    "$(pwd)/${OUTPUT_FILE}"
-    "/var/lib/docker/*"  # Docker运行时目录
-    "/.snapshots/*"      # Btrfs快照
-)
+# 创建智能排除列表（保留 Docker 运行时数据）
+{
+  echo "/dev/*"
+  echo "/proc/*"
+  echo "/sys/*"
+  echo "/tmp/*"
+  echo "/run/*"
+  echo "/mnt/*"
+  echo "/media/*"
+  echo "/lost+found"
+  echo "!/var/lib/docker"
+  echo "!/etc/docker"
+  echo "!/usr/bin/docker*"
+  echo "!/usr/libexec/docker"
+} > "$TMP_DIR/excludes.txt"
 
-# 构建排除参数
-EXCLUDE_OPTS=()
-for pattern in "${EXCLUDE_PATTERNS[@]}"; do
-    EXCLUDE_OPTS+=(--exclude="$pattern")
-done
+# 创建 Docker 数据快照（确保数据一致性）
+sudo systemctl stop docker.service docker.socket
+sudo tar --numeric-owner \
+         --xattrs \
+         --acls \
+         --selinux \
+         --exclude-from="$TMP_DIR/excludes.txt" \
+         -cpf - / \
+  | xz -9e -T0 > "$TMP_DIR/rootfs.tar.xz"
+sudo systemctl start docker.service docker.socket
 
-# 开始打包流程
-echo -e "\033[34m正在打包系统（压缩线程数：${COMPRESS_THREADS}）...\033[0m"
+# 创建支持嵌套 Docker 的 Dockerfile
+cat << EOF > "$TMP_DIR/Dockerfile"
+FROM scratch
+ADD rootfs.tar.xz /
 
-# 修正后的find命令：排除临时文件并安全处理特殊字符
-time find / \( -name "*~" -o -name "*.swp" \) -prune -o -type f -print0 |
-    /usr/bin/tar -cp \
-        --null -T - \
-        --one-file-system \
-        --xattrs \
-        --warning=no-xattr \
-        "${EXCLUDE_OPTS[@]}" \
-    | /usr/bin/xz $XZ_OPTIONS > "$OUTPUT_FILE"
+# 保留 Docker 运行时目录结构
+VOLUME ["/var/lib/docker", "/run/docker.sock"]
 
-# 结果校验
-if [[ $? -eq 0 ]]; then
-    echo -e "\033[32m打包成功！输出文件：$(realpath "${OUTPUT_FILE}")\033[0m"
-    echo -e "导入Docker命令："
-    echo -e "  \033[35mdocker import ${OUTPUT_FILE} ubuntu:custom-${TIMESTAMP}\033[0m"
-else
-    echo -e "\033[31m错误：打包过程失败，请检查存储空间和权限\033[0m"
-    exit 1
+# 安装 Docker 运行时依赖
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        iptables \
+        libdevmapper1.02.1 \
+        libseccomp2 \
+        pigz && \
+    rm -rf /var/lib/apt/lists/*
+
+# 配置 Docker 存储驱动
+ENV DOCKER_STORAGE_DRIVER=overlay2
+
+# 初始化容器 Docker 引擎
+COPY docker-entrypoint.sh /usr/local/bin/
+ENTRYPOINT ["docker-entrypoint.sh"]
+CMD ["dockerd"]
+EOF
+
+# 创建 Docker 入口脚本
+cat << 'EOF' > "$TMP_DIR/docker-entrypoint.sh"
+#!/bin/bash
+set -e
+
+# 初始化 Docker 存储目录
+if [ -d "/var/lib/docker" ]; then
+  chown -R root:root /var/lib/docker
+  find /var/lib/docker -type d -print0 | xargs -0 chmod 0700
 fi
+
+# 配置 cgroups
+if ! mount | grep -q cgroup; then
+  mount -t tmpfs -o uid=0,gid=0,mode=0755 cgroup /sys/fs/cgroup
+  mkdir -p /sys/fs/cgroup/systemd
+  mount -t cgroup -o none,name=systemd cgroup /sys/fs/cgroup/systemd
+fi
+
+exec "$@"
+EOF
+chmod +x "$TMP_DIR/docker-entrypoint.sh"
+
+# 构建镜像
+docker buildx build \
+  --builder host \
+  --platform linux/amd64 \
+  --output type=image,name="$TAG_NAME",compression=xz \
+  --progress plain \
+  --no-cache \
+  "$TMP_DIR"
+
+# 清理环境
+rm -rf "$TMP_DIR"
+
+echo -e "\n生成镜像信息："
+docker images | grep "$TAG_NAME"
