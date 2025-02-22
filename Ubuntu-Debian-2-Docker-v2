@@ -4,20 +4,43 @@ set -eo pipefail
 # 内存保护机制
 export XZ_DEFAULTS="-T0 --memlimit-compress=80%"
 
-# 增强型排除列表（精确到内核模块路径）
+# 增强型排除列表（包含动态路径）
 EXCLUDE_PATHS=(
     "/proc" "/sys" "/dev" "/tmp" "/run" "/mnt" "/media"
     "/var/cache" "/var/run" "/var/lock" "/lost+found"
     "/sys/module" "/sys/firmware" "/sys/fs/cgroup"
     "/sys/kernel" "/sys/devices/virtual" "/sys/class/*/device"
     "/sys/power" "/sys/hypervisor"
-    # 递归排除子目录
     "/proc/*" "/sys/*" "/dev/*" "/tmp/*" "/run/*" "/mnt/*" "/media/*"
     "/var/cache/*" "/var/run/*" "/var/lock/*" "/lost+found/*"
     "/sys/module/*" "/sys/firmware/*" "/sys/fs/cgroup/*"
     "/sys/kernel/*" "/sys/devices/virtual/*" "/sys/class/*/device/*"
     "/sys/power/*" "/sys/hypervisor/*"
+    "/var/lib/docker/tmp"  # 动态docker临时目录
+    "/var/lib/apt/lists/partial/*"  # apt缓存
 )
+
+# 日志配置
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+OUTPUT_FILE="ubuntu_system_${TIMESTAMP}.tar.xz"
+LOG_FILE="${OUTPUT_FILE%.*}.log"
+
+# 日志函数
+log() {
+    local level=$1
+    local message=$2
+    local timestamp=$(date "+%Y-%m-%d %H:%M:%S.%3N")
+    echo "[$timestamp] [$level] $message" | tee -a "$LOG_FILE" >&2
+}
+
+: > "$LOG_FILE"
+log "INFO" "初始化备份任务：$TIMESTAMP"
+
+# 动态校准进度机制
+calculate_size() {
+    log "INFO" "开始动态计算数据量..."
+    sudo du -sbx / "${tar_excludes[@]}" 2>&1 | tee -a "$LOG_FILE" | awk '{sum+=$1} END{print sum}'
+}
 
 # 转换排除参数
 tar_excludes=()
@@ -25,34 +48,52 @@ for path in "${EXCLUDE_PATHS[@]}"; do
     tar_excludes+=( "--exclude=$path" )
 done
 
-# 安全计算模式
-echo "[进度] 正在计算需要打包的数据量..."
-TOTAL_SIZE=$(sudo du -sbx / "${tar_excludes[@]}" 2>/dev/null | awk '{sum+=$1} END{print sum}')
+# 首次计算基准大小
+INITIAL_SIZE=$(calculate_size)
+log "INFO" "初始数据量估算：$((INITIAL_SIZE/1024/1024)) MB"
 
-# 输出文件配置
-TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-OUTPUT_FILE="ubuntu_system_${TIMESTAMP}.tar.xz"
-
-# 安全打包流程
+# 打包压缩流程
 {
-    echo "[步骤1/2] 系统打包 (预计耗时: $((TOTAL_SIZE/15000000))秒)" >&2
+    log "INFO" "启动打包进程..."
     sudo tar -cpPf - / "${tar_excludes[@]}" \
         --warning=no-all \
-        --ignore-failed-read \
-        | pv -s "$TOTAL_SIZE" -N "打包进度" -f
-
-    echo -e "\n[步骤2/2] 内存优化压缩 (最大使用80%内存)" >&2
-} | xz -T0 -7e --verbose -c > "$OUTPUT_FILE" 2> >(
-    # 解析xz进度信息
+        --ignore-failed-read 2>&1
+    
+    log "INFO" "打包进程已正常退出，等待数据刷新..."
+    sync  # 确保所有数据写入管道
+} | pv -n -s $INITIAL_SIZE -N "打包进度" | tee >(sha256sum > "${OUTPUT_FILE}.sha256") \
+  | xz -T0 -7e -v > "$OUTPUT_FILE" 2> >(
+    # 压缩进度处理器
     while IFS= read -r line; do
-        if [[ $line =~ ([0-9]+\.[0-9]+)% ]]; then
-            printf "压缩进度: %s%%\r" "${BASH_REMATCH[1]}"
+        if [[ $line =~ ([0-9.]+)% ]]; then
+            percent=${BASH_REMATCH[1]}
+            printf "[%s] [PROGRESS] 压缩进度: %s%%\n" "$(date +%T)" "$percent" >> "$LOG_FILE"
+            printf "压缩进度: %s%%\r" "$percent" >&2
+        else
+            echo "[$(date +%T)] [XZ] $line" >> "$LOG_FILE"
         fi
     done
 )
 
-# 结果验证
-echo -e "\n[完成] 生成文件信息:"
-ls -lh "$OUTPUT_FILE"
-echo "SHA256校验: $(sha256sum "$OUTPUT_FILE" | cut -d' ' -f1)"
-echo "Docker导入命令: docker import $OUTPUT_FILE ubuntu:custom"
+# 动态校准最终大小
+FINAL_SIZE=$(stat -c%s "$OUTPUT_FILE")
+log "INFO" "实际输出文件大小：$((FINAL_SIZE/1024/1024)) MB"
+
+# 完整性验证
+log "INFO" "启动完整性校验..."
+VALIDATION_DATA=$(tar -tvJf "$OUTPUT_FILE" 2>&1 | tee -a "$LOG_FILE" | wc -l)
+if [ $VALIDATION_DATA -lt 100 ]; then
+    log "ERROR" "压缩文件可能损坏，验证条目不足"
+    exit 1
+fi
+
+# 校验和验证
+log "INFO" "校验和验证..."
+CALC_SUM=$(sha256sum "$OUTPUT_FILE" | cut -d' ' -f1)
+STORED_SUM=$(cat "${OUTPUT_FILE}.sha256" | cut -d' ' -f1)
+if [ "$CALC_SUM" != "$STORED_SUM" ]; then
+    log "ERROR" "校验和不匹配：计算值=$CALC_SUM，存储值=$STORED_SUM"
+    exit 2
+fi
+
+log "SUCCESS" "备份验证完成，数据完整"
